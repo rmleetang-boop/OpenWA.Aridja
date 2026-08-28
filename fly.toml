@@ -9,7 +9,7 @@ primary_region = 'jnb'
 [build]
 
 [processes]
-  app = 'node ./dbsetup.js node dist/main'
+  app = 'node dist/main.js'
 
 [[mounts]]
   source = 'data'
