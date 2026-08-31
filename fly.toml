@@ -8,12 +8,29 @@ primary_region = 'jnb'
 
 [build]
 
+[env]
+  # OpenWA stores the database and WhatsApp auth profiles under /app/data.
+  # Keep these paths explicit so a Fly machine replacement cannot fall back to the ephemeral layer.
+  MAIN_DATABASE_NAME = '/app/data/main.sqlite'
+  DATABASE_NAME = '/app/data/openwa.sqlite'
+  SESSION_DATA_PATH = '/app/data/sessions'
+  BAILEYS_AUTH_DIR = '/app/data/baileys'
+  AUTO_START_SESSIONS = 'true'
+  NODE_ID = 'openwa-aridja'
+  # Fetching status@broadcast immediately after a fresh pairing can make WhatsApp revoke the companion.
+  STATUS_SEED_ON_READY = 'false'
+  # Give cold Fly boots enough time to load Chromium and WhatsApp Web before failing authentication.
+  WWEBJS_AUTH_TIMEOUT_MS = '120000'
+  # Use WhatsApp's first-party build during recovery; a stale remote pin can leave QR/authentication stuck.
+  WWEBJS_WEB_VERSION = 'off'
+
 [processes]
   app = 'node dist/main.js'
 
 [[mounts]]
   source = 'data'
-  destination = '/data'
+  # OpenWA's persistent state root is /app/data, not /data.
+  destination = '/app/data'
   auto_extend_size_threshold = 80
   auto_extend_size_increment = '1GB'
   auto_extend_size_limit = '10GB'
@@ -21,13 +38,21 @@ primary_region = 'jnb'
 [http_service]
   internal_port = 2785
   force_https = true
-  auto_stop_machines = 'stop'
+  # A WhatsApp engine must remain alive even when there is no dashboard traffic.
+  auto_stop_machines = 'off'
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ['app']
 
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '10s'
+    grace_period = '60s'
+    method = 'GET'
+    path = '/api/health/ready'
+
 [[vm]]
-  memory = '1gb'
-  cpu_kind = 'shared'
-  cpus = 1
-  memory_mb = 1024
+memory = '2gb'
+cpu_kind = 'shared'
+cpus = 1
+memory_mb = 2048
