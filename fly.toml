@@ -21,8 +21,9 @@ primary_region = 'jnb'
   STATUS_SEED_ON_READY = 'false'
   # Give cold Fly boots enough time to load Chromium and WhatsApp Web before failing authentication.
   WWEBJS_AUTH_TIMEOUT_MS = '120000'
-  # Use WhatsApp's first-party build during recovery; a stale remote pin can leave QR/authentication stuck.
-  WWEBJS_WEB_VERSION = 'off'
+  # Let OpenWA resolve and pin a settled, non-beta wa-version build; native auto-select can authenticate
+  # successfully but never emit ready or attach the inbound event bridge on recent Web builds.
+  WWEBJS_WEB_VERSION = 'auto'
 
 [processes]
   app = 'node dist/main.js'
