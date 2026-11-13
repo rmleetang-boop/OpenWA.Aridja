@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Copy, FileText, Loader2, Plus, Search, Trash2 } from 'lucide-react';
+import { AlertCircle, Copy, FileText, Loader2, Plus, Search, Trash2 } from 'lucide-react';
 import { type MessageTemplate, type TemplatePayload } from '../services/api';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import { useRole } from '../hooks/useRole';
@@ -15,6 +15,7 @@ import {
 import { PageHeader } from '../components/PageHeader';
 import { Modal } from '../components/Modal';
 import { copyToClipboard } from '../utils/clipboard';
+import { captionLength } from '../utils/bulkMedia';
 import './Templates.css';
 
 type TemplateForm = {
@@ -31,9 +32,20 @@ const emptyForm: TemplateForm = {
   footer: '',
 };
 
-function extractPlaceholders(template: TemplateForm | MessageTemplate) {
+// The gateway's renderer pattern (PLACEHOLDER_PATTERN in src/common/utils/template-render.ts), kept verbatim: a send
+// fills the legacy single-brace `{key}` form as well as `{{key}}`, so the list and the preview read both. Only the
+// double-brace form is advertised.
+export const PLACEHOLDER_PATTERN = /\{\{\s*([\w.-]+)\s*\}\}|\{(\w+)\}/g;
+
+/** The variables a send fills, each once, with the form it is written in: `{{key}}`, or `{key}` for the legacy form. */
+function extractPlaceholders(template: TemplateForm | MessageTemplate): Array<{ key: string; token: string }> {
   const source = [template.header, template.body, template.footer].filter(Boolean).join('\n');
-  return Array.from(new Set(Array.from(source.matchAll(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g), match => match[1]))).sort();
+  const tokens = new Map<string, string>();
+  for (const [, doubleKey, singleKey] of source.matchAll(PLACEHOLDER_PATTERN)) {
+    const key = doubleKey ?? singleKey;
+    if (!tokens.has(key)) tokens.set(key, doubleKey !== undefined ? `{{${key}}}` : `{${key}}`);
+  }
+  return [...tokens.keys()].sort().map(key => ({ key, token: tokens.get(key)! }));
 }
 
 function toPayload(form: TemplateForm): TemplatePayload {
@@ -45,30 +57,61 @@ function toPayload(form: TemplateForm): TemplatePayload {
   };
 }
 
+// The gateway's limits (template.dto.ts), past which a production gateway answers a bare "Bad Request" naming no field.
+// The name is counted in code points, the other fields the way class-validator's MaxLength counts them.
+const NAME_MAX_LENGTH = 100;
+const BODY_MAX_LENGTH = 4096;
+const HEADER_FOOTER_MAX_LENGTH = 1024;
+
+// A preview value the operator gave for this placeholder. The gateway fills only own properties, so a placeholder named
+// like an inherited member (constructor, toString, __proto__) must not read that member.
+const ownValue = (values: Record<string, string>, key: string): string | undefined =>
+  Object.hasOwn(values, key) ? values[key] : undefined;
+
 function renderPreview(template: TemplateForm, values: Record<string, string>) {
-  return [template.header, template.body, template.footer]
-    .filter(Boolean)
-    .join('\n\n')
-    .replace(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, (_match, key: string) => values[key] || `{{${key}}}`);
+  return (
+    [template.header, template.body, template.footer]
+      .filter(Boolean)
+      .join('\n\n')
+      // An unfilled placeholder stays as written, as the gateway leaves it.
+      .replace(
+        PLACEHOLDER_PATTERN,
+        (match, doubleKey: string | undefined, singleKey: string | undefined) =>
+          ownValue(values, doubleKey ?? singleKey!) || match,
+      )
+  );
 }
 
 export function Templates() {
   const { t } = useTranslation();
   useDocumentTitle(t('templates.title'));
   const { canWrite } = useRole();
-  const { data: sessions = [], isLoading: loadingSessions } = useSessionsQuery();
+  const { data: sessions = [], isLoading: loadingSessions, error: sessionsError } = useSessionsQuery();
+  // A failed read is not "no sessions": the gateway may simply be restarting. A failed background refetch keeps
+  // the cached list, so only a read that never produced one counts.
+  const sessionsFailed = !!sessionsError && sessions.length === 0;
   const [selectedSessionId, setSelectedSessionId] = useState('');
   const [form, setForm] = useState<TemplateForm>(emptyForm);
+  // The draft on screen now, read by a save that resolves after the operator may have moved on.
+  const formRef = useRef(form);
+  useEffect(() => {
+    formRef.current = form;
+  }, [form]);
+  // Bumped whenever the editor starts another draft (new, opened or session switched), unlike edits to the same one.
+  const draftRef = useRef(0);
   const [editingTemplate, setEditingTemplate] = useState<MessageTemplate | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<MessageTemplate | null>(null);
   const toast = useToast();
   const [previewValues, setPreviewValues] = useState<Record<string, string>>({});
   const [searchTerm, setSearchTerm] = useState('');
 
-  const { data: templates = [], isLoading: loadingTemplates } = useTemplatesQuery(
-    selectedSessionId,
-    !!selectedSessionId,
-  );
+  // The template list route is OPERATOR-only and the gateway records every refusal as a failed authentication,
+  // so a key that cannot write is not sent it.
+  const {
+    data: templates = [],
+    isLoading: loadingTemplates,
+    error: templatesError,
+  } = useTemplatesQuery(selectedSessionId, canWrite && !!selectedSessionId);
   const createMutation = useCreateTemplateMutation();
   const updateMutation = useUpdateTemplateMutation();
   const deleteMutation = useDeleteTemplateMutation();
@@ -86,30 +129,52 @@ export function Templates() {
     );
   }, [searchTerm, templates]);
   const isSaving = createMutation.isPending || updateMutation.isPending;
+  // Measured on what a save sends (trimmed), each with its gateway limit.
+  const sent = toPayload(form);
+  const limits = {
+    name: [[...sent.name].length, NAME_MAX_LENGTH],
+    header: [captionLength(sent.header ?? ''), HEADER_FOOTER_MAX_LENGTH],
+    body: [captionLength(sent.body), BODY_MAX_LENGTH],
+    footer: [captionLength(sent.footer ?? ''), HEADER_FOOTER_MAX_LENGTH],
+  } as const;
+  const overLimit = Object.values(limits).some(([count, max]) => count > max);
+  const limitHint = ([count, max]: readonly [number, number]) => (
+    <span className="field-error" role="status">
+      {count > max ? t('common.fieldTooLong', { max, count }) : ''}
+    </span>
+  );
+  // The row whose update is in flight: the list shows its pre-save values until the update settles, and
+  // reopening it then would load them into the editor to be saved back. Every other row is current.
+  const updatingId = updateMutation.isPending ? updateMutation.variables?.id : undefined;
 
+  // Select the first session, and again once the selected one is gone (deleted elsewhere): a stale id
+  // matches no option, so the select would show another session while every read and write still
+  // went to the deleted one.
   useEffect(() => {
-    if (!selectedSessionId && sessions.length > 0) {
-      setSelectedSessionId(sessions[0].id);
-    }
+    if (sessions.some(session => session.id === selectedSessionId)) return;
+    const next = sessions[0]?.id ?? '';
+    if (next === selectedSessionId) return;
+    setSelectedSessionId(next);
+    draftRef.current += 1;
+    setForm(emptyForm);
+    setEditingTemplate(null);
+    setPreviewValues({});
   }, [selectedSessionId, sessions]);
 
   useEffect(() => {
-    setPreviewValues(current => {
-      const next: Record<string, string> = {};
-      for (const key of placeholders) {
-        next[key] = current[key] || '';
-      }
-      return next;
-    });
+    // Built as own entries: an assignment to `__proto__` would set the prototype instead of a value.
+    setPreviewValues(current => Object.fromEntries(placeholders.map(({ key }) => [key, ownValue(current, key) || ''])));
   }, [placeholders]);
 
   const resetForm = () => {
+    draftRef.current += 1;
     setForm(emptyForm);
     setEditingTemplate(null);
     setPreviewValues({});
   };
 
   const openEdit = (template: MessageTemplate) => {
+    draftRef.current += 1;
     setEditingTemplate(template);
     setForm({
       name: template.name,
@@ -117,28 +182,39 @@ export function Templates() {
       body: template.body,
       footer: template.footer || '',
     });
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    // An explicit smooth ignores the CSS scroll-behavior, so the preference is asked for here.
+    const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    window.scrollTo({ top: 0, behavior: reduceMotion ? 'auto' : 'smooth' });
   };
 
   const handleSave = async () => {
     if (!selectedSessionId || !form.name.trim() || !form.body.trim()) return;
+    const savedForm = form;
+    const draft = draftRef.current;
 
     try {
+      let saved: MessageTemplate;
       if (editingTemplate) {
-        await updateMutation.mutateAsync({
+        saved = await updateMutation.mutateAsync({
           sessionId: selectedSessionId,
           id: editingTemplate.id,
           data: toPayload(form),
         });
         toast.success(t('templates.toasts.updated'));
       } else {
-        await createMutation.mutateAsync({
+        saved = await createMutation.mutateAsync({
           sessionId: selectedSessionId,
           data: toPayload(form),
         });
         toast.success(t('templates.toasts.created'));
       }
-      resetForm();
+      // Edits typed into this draft while the save was in flight stay on screen; point them at the saved
+      // row so the next save updates it (a second create would fail the unique name check) and the
+      // editor header reflects the stored name.
+      if (draftRef.current === draft && formRef.current !== savedForm) setEditingTemplate(saved);
+      // Every edit, template switch and session switch replaces the form object, so a save that
+      // resolves after any of them must leave the newer draft alone.
+      if (formRef.current === savedForm) resetForm();
     } catch (err) {
       toast.error(
         t(editingTemplate ? 'templates.toasts.updateFailed' : 'templates.toasts.createFailed', {
@@ -150,11 +226,12 @@ export function Templates() {
 
   const handleDelete = async () => {
     if (!selectedSessionId || !deleteTarget) return;
+    const draft = draftRef.current;
     try {
       await deleteMutation.mutateAsync({ sessionId: selectedSessionId, id: deleteTarget.id });
       toast.success(t('templates.toasts.deleted'));
-      if (editingTemplate?.id === deleteTarget.id) resetForm();
-      setDeleteTarget(null);
+      if (draftRef.current === draft && editingTemplate?.id === deleteTarget.id) resetForm();
+      setDeleteTarget(current => (current === deleteTarget ? null : current));
     } catch (err) {
       toast.error(
         t('templates.toasts.deleteFailed', {
@@ -193,7 +270,9 @@ export function Templates() {
               resetForm();
             }}
           >
-            {sessions.length === 0 && <option value="">{t('templates.noSessions')}</option>}
+            {sessions.length === 0 && (
+              <option value="">{t(sessionsFailed ? 'dashboard.loadError' : 'templates.noSessions')}</option>
+            )}
             {sessions.map(session => (
               <option key={session.id} value={session.id}>
                 {session.name}
@@ -203,7 +282,13 @@ export function Templates() {
         }
       />
 
-      {sessions.length === 0 ? (
+      {sessionsFailed ? (
+        <div className="templates-empty-page" role="alert">
+          <AlertCircle size={48} strokeWidth={1} />
+          <h3>{t('dashboard.loadError')}</h3>
+          <p>{sessionsError.message}</p>
+        </div>
+      ) : sessions.length === 0 ? (
         <div className="templates-empty-page">
           <FileText size={48} strokeWidth={1} />
           <h3>{t('templates.empty.noSessionsTitle')}</h3>
@@ -232,9 +317,28 @@ export function Templates() {
               />
             </div>
 
-            {loadingTemplates ? (
+            {/* No session selected yet means the first-session effect has not run: the read is still to start. */}
+            {loadingTemplates || !selectedSessionId ? (
               <div className="templates-loading-inline">
                 <Loader2 className="animate-spin" size={24} />
+              </div>
+            ) : (templatesError || !canWrite) && templates.length === 0 ? (
+              // A failed read is not an empty library: a key below operator is refused here (the route is
+              // OPERATOR-only, so it is never sent), and a gateway error would otherwise read as "no templates
+              // saved". The 403 branch stays for a key whose role the page took for a writer's.
+              <div className="templates-empty-list" role="alert">
+                <AlertCircle size={40} strokeWidth={1} />
+                {!canWrite || (templatesError as { status?: number } | null)?.status === 403 ? (
+                  <>
+                    <h3>{t('templates.empty.forbiddenTitle')}</h3>
+                    <p>{t('templates.empty.forbiddenDesc')}</p>
+                  </>
+                ) : (
+                  <>
+                    <h3>{t('templates.empty.loadErrorTitle')}</h3>
+                    <p>{templatesError?.message}</p>
+                  </>
+                )}
               </div>
             ) : templates.length === 0 ? (
               <div className="templates-empty-list">
@@ -245,7 +349,7 @@ export function Templates() {
             ) : filteredTemplates.length === 0 ? (
               <div className="templates-empty-list compact">
                 <Search size={32} strokeWidth={1.5} />
-                <h3>{t('templates.empty.title')}</h3>
+                <h3>{t('templates.empty.noMatch', 'No templates match your search.')}</h3>
               </div>
             ) : (
               <div className="template-list" role="list">
@@ -253,20 +357,37 @@ export function Templates() {
                   const templatePlaceholders = extractPlaceholders(template);
                   const isSelected = editingTemplate?.id === template.id;
                   return (
-                    <button
+                    <div
                       key={template.id}
-                      className={`template-list-item ${isSelected ? 'selected' : ''}`}
-                      onClick={() => openEdit(template)}
-                      type="button"
+                      className={`template-list-row ${canWrite ? 'deletable' : ''}`}
+                      role="listitem"
                     >
-                      <span className="template-list-title">{template.name}</span>
-                      <span className="template-list-body">{template.body}</span>
-                      <span className="template-list-meta">
-                        {templatePlaceholders.length > 0
-                          ? templatePlaceholders.map(key => `{{${key}}}`).join(' ')
-                          : t('templates.noPlaceholders')}
-                      </span>
-                    </button>
+                      <button
+                        className={`template-list-item ${isSelected ? 'selected' : ''}`}
+                        onClick={() => openEdit(template)}
+                        disabled={template.id === updatingId}
+                        type="button"
+                      >
+                        <span className="template-list-title">{template.name}</span>
+                        <span className="template-list-body">{template.body}</span>
+                        <span className="template-list-meta">
+                          {templatePlaceholders.length > 0
+                            ? templatePlaceholders.map(({ token }) => token).join(' ')
+                            : t('templates.noPlaceholders')}
+                        </span>
+                      </button>
+                      {canWrite && (
+                        <button
+                          className="icon-btn danger template-list-delete"
+                          title={t('common.delete')}
+                          aria-label={t('common.delete')}
+                          onClick={() => setDeleteTarget({ ...template })}
+                          type="button"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      )}
+                    </div>
                   );
                 })}
               </div>
@@ -294,7 +415,7 @@ export function Templates() {
                   <button
                     className="icon-btn danger"
                     title={t('common.delete')}
-                    onClick={() => setDeleteTarget(editingTemplate)}
+                    onClick={() => setDeleteTarget({ ...editingTemplate })}
                     type="button"
                   >
                     <Trash2 size={16} />
@@ -313,6 +434,7 @@ export function Templates() {
                   placeholder={t('templates.namePlaceholder')}
                   disabled={!canWrite}
                 />
+                {limitHint(limits.name)}
               </div>
 
               <div className="template-message-fields">
@@ -325,6 +447,7 @@ export function Templates() {
                     placeholder={t('templates.headerPlaceholder')}
                     disabled={!canWrite}
                   />
+                  {limitHint(limits.header)}
                 </div>
 
                 <div className="form-group body-field">
@@ -337,6 +460,7 @@ export function Templates() {
                     rows={10}
                     disabled={!canWrite}
                   />
+                  {limitHint(limits.body)}
                 </div>
 
                 <div className="form-group">
@@ -348,6 +472,7 @@ export function Templates() {
                     placeholder={t('templates.footerPlaceholder')}
                     disabled={!canWrite}
                   />
+                  {limitHint(limits.footer)}
                 </div>
               </div>
 
@@ -358,7 +483,9 @@ export function Templates() {
                 <button
                   className="btn-primary"
                   onClick={handleSave}
-                  disabled={!canWrite || isSaving || !selectedSessionId || !form.name.trim() || !form.body.trim()}
+                  disabled={
+                    !canWrite || isSaving || !selectedSessionId || !form.name.trim() || !form.body.trim() || overLimit
+                  }
                   type="button"
                 >
                   {isSaving ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} />}
@@ -381,11 +508,11 @@ export function Templates() {
             <div className="template-variable-panel">
               {placeholders.length > 0 ? (
                 <div className="placeholder-list">
-                  {placeholders.map(key => (
+                  {placeholders.map(({ key, token }) => (
                     <label key={key}>
-                      <span>{`{{${key}}}`}</span>
+                      <span>{token}</span>
                       <input
-                        value={previewValues[key] || ''}
+                        value={ownValue(previewValues, key) || ''}
                         onChange={event => setPreviewValues({ ...previewValues, [key]: event.target.value })}
                         placeholder={t('templates.previewValuePlaceholder')}
                       />

@@ -1,6 +1,25 @@
 import { EditedMessage, IncomingMessage, MessageContact, MessageType } from '../interfaces/whatsapp-engine.interface';
-import type { SerializedWid } from '../types/whatsapp-web-js.types';
+import { readWid, type SerializedWid } from '../types/whatsapp-web-js.types';
 import { chatKind } from '../identity/wa-id';
+
+/**
+ * Bounds on an inbound poll, applied by both engines. WhatsApp itself allows 12 options of 100
+ * characters under a 255-character question; these sit well above that, so nothing a client can send
+ * is cut, while a malformed poll cannot bloat a stored row, a webhook payload or a socket frame. A poll
+ * over a bound is truncated, not dropped.
+ */
+export const POLL_MAX_OPTIONS = 32;
+export const POLL_TEXT_MAX_LENGTH = 1024;
+
+/** A poll question or option text, cut to {@link POLL_TEXT_MAX_LENGTH}. */
+export function boundPollText(text: string): string {
+  return text.slice(0, POLL_TEXT_MAX_LENGTH);
+}
+
+/** A poll's options, cut to {@link POLL_MAX_OPTIONS} entries of at most {@link POLL_TEXT_MAX_LENGTH}. */
+export function boundPollOptions(options: string[]): string[] {
+  return options.slice(0, POLL_MAX_OPTIONS).map(boundPollText);
+}
 
 /**
  * Map a whatsapp-web.js `MessageTypes` token to the engine-neutral {@link MessageType}, so no
@@ -10,7 +29,14 @@ import { chatKind } from '../identity/wa-id';
  */
 export function mapWwebjsMessageType(raw: string): MessageType {
   switch (raw) {
+    // Besides plain `chat`, a tapped button, list row or template button: WA Web carries the chosen
+    // option's text in the body, and Baileys reports the same replies as `text` (#562). `hsm` and
+    // `interactive` prompts are left out: their body can be empty, and an empty text is worse than
+    // `unknown`.
     case 'chat':
+    case 'buttons_response':
+    case 'list_response':
+    case 'template_button_reply':
       return 'text';
     case 'image':
       return 'image';
@@ -35,6 +61,10 @@ export function mapWwebjsMessageType(raw: string): MessageType {
       return 'poll';
     case 'revoked':
       return 'revoked';
+    case 'order':
+      return 'order';
+    case 'product':
+      return 'product';
     default:
       return 'unknown';
   }
@@ -63,8 +93,24 @@ export interface RawMessageFields {
   author?: string;
   /** WIDs @mentioned in the message; whatsapp-web.js attaches this to every Message. */
   mentionedIds?: string[];
+  /** Whether the message was forwarded, and how many times; whatsapp-web.js sets both on every Message. */
+  isForwarded?: boolean;
+  forwardingScore?: number;
   /** Raw wwebjs payload; `notifyName` carries the sender's push name without an extra lookup. */
   _data?: { notifyName?: string; ephemeralDuration?: number };
+  /** Set on `order` messages: the placed order's id, and the single-order token that unlocks its items. */
+  orderId?: string;
+  token?: string;
+  /** Set on `product` messages: the shared catalog product. */
+  productId?: string;
+  pollName?: string;
+  pollOptions?: Array<string | { name?: string }>;
+  allowMultipleAnswers?: boolean;
+  /** Product title / description. whatsapp-web.js exposes these only for a product card. */
+  title?: string;
+  description?: string;
+  /** The catalog owner's JID, on a shared product card. */
+  businessOwnerJid?: string;
 }
 
 /**
@@ -82,7 +128,7 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
     // backport every arriving message otherwise carries `id: undefined`. The empty sentinel means
     // "received, id unreadable" and is normalized to NULL where it is persisted — never to `''`, which
     // the non-partial (sessionId, waMessageId) unique index would collide the second such message on.
-    id: msg.id._serialized ?? msg.id.$1 ?? '',
+    id: readWid(msg.id) ?? '',
     from: msg.from,
     to: msg.to,
     chatId,
@@ -107,6 +153,16 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
     incoming.mentionedIds = msg.mentionedIds;
   }
 
+  // Forwarded content is not the sender's own words; surface that so consumers do not attribute it to them.
+  // whatsapp-web.js defaults forwardingScore to 0 when the raw payload carries no score at all, so the
+  // same positive-value gate the ephemeralDuration field above uses keeps a real 0 from reading as a signal.
+  if (msg.isForwarded === true) {
+    incoming.isForwarded = true;
+    if (typeof msg.forwardingScore === 'number' && msg.forwardingScore > 0) {
+      incoming.forwardingScore = msg.forwardingScore;
+    }
+  }
+
   // Flag senders identified by a WhatsApp privacy id (`@lid`) so engine-neutral code can opt to
   // resolve a phone number without matching the engine-specific JID scheme itself (#263).
   const senderJid = msg.author ?? msg.from;
@@ -123,6 +179,36 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
   // Ephemeral/disappearing-messages timer, when the chat has one set.
   if (msg._data?.ephemeralDuration && msg._data.ephemeralDuration > 0) {
     incoming.ephemeralDuration = msg._data.ephemeralDuration;
+  }
+
+  // Commerce ids, keyed off the mapped type so a stray `title` on some other message shape cannot
+  // fabricate a product. Without the id neither entry is actionable, so both are then left unset.
+  if (incoming.type === 'order' && msg.orderId) {
+    incoming.order = { orderId: msg.orderId, ...(msg.token ? { token: msg.token } : {}) };
+  } else if (incoming.type === 'product' && msg.productId) {
+    incoming.product = {
+      productId: msg.productId,
+      ...(msg.title ? { title: msg.title } : {}),
+      ...(msg.description ? { description: msg.description } : {}),
+      ...(msg.businessOwnerJid ? { businessOwnerJid: msg.businessOwnerJid } : {}),
+    };
+  }
+
+  if (incoming.type === 'poll') {
+    // The question is the body of a poll, so it is bounded with the poll.
+    incoming.body = boundPollText(incoming.body);
+    if (Array.isArray(msg.pollOptions)) {
+      const options = msg.pollOptions
+        .map(option => (typeof option === 'string' ? option : option?.name))
+        .filter((option): option is string => typeof option === 'string');
+      if (options.length) {
+        incoming.poll = {
+          name: boundPollText(msg.pollName ?? msg.body),
+          options: boundPollOptions(options),
+          allowMultipleAnswers: msg.allowMultipleAnswers === true,
+        };
+      }
+    }
   }
 
   return incoming;
@@ -156,7 +242,7 @@ export function buildEditedMessage(message: IncomingMessage, hasMedia: boolean):
  * full wwebjs `Contact`, and so the async getters stay out by construction.
  */
 export interface RawContactFields {
-  id?: { _serialized?: string };
+  id?: SerializedWid;
   number?: string;
   name?: string;
   pushname?: string;
@@ -184,7 +270,7 @@ export function mapContactFields(contact: RawContactFields, full = false): Messa
   if (contact.name) out.name = contact.name;
   if (contact.pushname) out.pushName = contact.pushname;
   if (!full) return out;
-  const id = contact.id?._serialized;
+  const id = readWid(contact.id);
   if (id) out.id = id;
   if (contact.number) out.number = contact.number;
   if (contact.shortName) out.shortName = contact.shortName;

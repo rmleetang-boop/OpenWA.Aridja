@@ -5,7 +5,8 @@
 # official postgres image runs it ONCE on first initialization (before any app migration).
 # It creates the configured POSTGRES_SCHEMA and sets the database default search_path so the
 # built-in container works zero-config with a custom schema — the app's TypeORM `schema` option
-# + `extra.options search_path` then resolve every table + the migration ledger into it.
+# + the search_path it sets with set_config on every new connection then resolve every table + the
+# migration ledger into it.
 #
 # No-op when POSTGRES_SCHEMA is empty or 'public' (the default): the public schema always
 # exists and the default search_path already includes it, so there is nothing to do.
@@ -25,14 +26,15 @@ fi
 
 # The value is interpolated into the CREATE SCHEMA / SET search_path statements below, so apply
 # the same boot-time validation the app does (src/config/env.validation.ts): a plain, non-reserved
-# Postgres identifier or nothing. Fail fast here rather than let a typo reach the SQL.
-identifier_re='^[A-Za-z_][A-Za-z0-9_]{0,62}$'
+# Postgres identifier or nothing. Fail fast here rather than let a typo reach the SQL. Lower case
+# only: the app sets an unquoted search_path, which Postgres folds to lower case.
+identifier_re='^[a-z_][a-z0-9_]{0,62}$'
 if ! [[ "$schema" =~ $identifier_re ]]; then
-  echo "postgres-init-schema: ERROR: POSTGRES_SCHEMA must be a valid Postgres identifier (a letter or underscore, then letters/digits/underscores, max 63 chars; got '${schema}')." >&2
+  echo "postgres-init-schema: ERROR: POSTGRES_SCHEMA must be a valid lower-case Postgres identifier (a lower-case letter or underscore, then lower-case letters/digits/underscores, max 63 chars; got '${schema}')." >&2
   exit 1
 fi
 case "$schema" in
-  [pP][gG]_*)
+  pg_*)
     echo "postgres-init-schema: ERROR: POSTGRES_SCHEMA must not use the reserved \"pg_\" prefix (got '${schema}')." >&2
     exit 1
     ;;

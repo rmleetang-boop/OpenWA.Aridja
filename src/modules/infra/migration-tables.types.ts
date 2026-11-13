@@ -12,6 +12,8 @@ export interface SessionRow {
   lastActiveAt: string | null;
   createdAt: string;
   updatedAt: string;
+  // Absent from backups written before the column existed.
+  desiredState?: string | null;
 }
 
 export interface WebhookRow {
@@ -105,13 +107,29 @@ export interface BaileysStoredMessageRow {
   createdAt: string;
 }
 
-// The persisted lid->phone resolution cache. Not a FK to sessions (provenance only), so the import's
+// The persisted lid->phone resolution cache. sessionId names the session whose negative may clear the
+// phone; it is not a FK to sessions, so the import's
 // `DELETE FROM sessions` never clears it — it must be exported + re-inserted explicitly or a
 // backup→restore into a fresh DB loses the whole cache (it self-heals via re-lookup, but lossily).
 export interface LidMappingRow {
+  isReported?: boolean | number;
   lid: string;
   phone: string | null;
   sessionId: string | null;
+  updatedAt: string;
+}
+
+export interface ChatStateRow {
+  sessionId: string;
+  chatId: string;
+  muteEndTime: number | null;
+  // boolean on Postgres, 0/1 on SQLite; carried through as-is like PluginInstanceRow.enabled.
+  archived: boolean | number;
+  pinned: boolean | number;
+  // Absent from an archive taken before the column existed; null reads as its set fields observed.
+  observed?: string | null;
+  // Epoch ms WhatsApp deleted the chat; absent from an archive taken before the column existed.
+  deletedAt?: number | null;
   updatedAt: string;
 }
 
@@ -170,6 +188,8 @@ export interface WebhookDeliveryFailureRow {
   attempts: number;
   lastStatusCode: number | null;
   lastError: string;
+  /** Legacy archives may carry replay data; current exports omit it at the SQL projection. */
+  payload?: string | null;
   createdAt: string;
 }
 
@@ -250,6 +270,7 @@ export interface MigrationTables {
   templates: TemplateRow[];
   baileysStoredMessages: BaileysStoredMessageRow[];
   lidMappings: LidMappingRow[];
+  chatStates: ChatStateRow[];
   pluginInstances: PluginInstanceRow[];
   conversationMappings: ConversationMappingRow[];
   ingressEvents: IngressEventRow[];
