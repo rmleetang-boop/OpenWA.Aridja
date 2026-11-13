@@ -78,6 +78,9 @@ export function parseWaId(jid: string): ParsedWaId {
   }
   const domain = lower.slice(at + 1);
   const [local, device] = lower.slice(0, at).split(':');
+  if (lower.indexOf('@') !== at || !local) {
+    return { kind: 'unknown', userPart: '', raw };
+  }
   const kind: WaIdKind = DOMAIN_KINDS.get(domain) ?? 'unknown';
   return { kind, userPart: local, device, raw };
 }
@@ -114,7 +117,11 @@ export function isAddressableParticipant(value: string): boolean {
 }
 
 /**
- * Qualify a bare number to the neutral `@c.us` dialect. Anything else passes through verbatim.
+ * Qualify a bare number to the neutral `@c.us` dialect, and reduce an individual id to its neutral
+ * form (`<phone>@c.us` or `<lid>@lid`: lowercased, `:device` suffix dropped, the `s.whatsapp.net`
+ * and hosted dialects folded). {@link isIndividualWid} accepts every one of those variants, so the id
+ * handed to the engine has to be the one a group's participant list is keyed by, or a real member is
+ * reported as not a member. A lid is not resolved: it stays a lid. Anything else passes through verbatim.
  *
  * Deliberately keyed on the bare-number shape rather than on the absence of `@`: the old rule
  * (`p.includes('@') ? p : p + '@c.us'`) minted an id out of ANY un-domained string, so `abc` became
@@ -122,7 +129,8 @@ export function isAddressableParticipant(value: string): boolean {
  */
 export function toParticipantWid(value: string): string {
   const trimmed = value.trim();
-  return NUMERIC_ID.test(trimmed) ? `${trimmed}@c.us` : trimmed;
+  if (NUMERIC_ID.test(trimmed)) return `${trimmed}@c.us`;
+  return isIndividualWid(trimmed) ? toNeutralJid(trimmed) : trimmed;
 }
 
 /**

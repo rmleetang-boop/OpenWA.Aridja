@@ -31,6 +31,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { writeFileAtomic } = require('./atomic-write');
 
 const DEFAULT_WWJS = path.join(__dirname, '..', 'node_modules', 'whatsapp-web.js');
 const GROUP_CHAT_PATH = path.join('src', 'structures', 'GroupChat.js');
@@ -125,6 +126,21 @@ function occurrences(source, needle) {
   return source.split(needle).length - 1;
 }
 
+/**
+ * Every group's replacement present, for the startup guard (engine-patch-status.ts). All three
+ * actions must carry it: a tree left by the LEGACY shape above scores exactly one of three, and it
+ * still answers 500 when promoting an existing admin, so ANY would report that tree as healthy.
+ * Unreadable reads as applied, since a tree we cannot inspect is not evidence of a broken one.
+ */
+function isApplied(wwjsDir = DEFAULT_WWJS) {
+  try {
+    const source = fs.readFileSync(path.join(wwjsDir, GROUP_CHAT_PATH), 'utf8');
+    return ACTIONS.every((action) => occurrences(source, replaceFor(action)) === 1);
+  } catch {
+    return true;
+  }
+}
+
 function applyParticipantArityPatches(wwjsDir = DEFAULT_WWJS) {
   const groupChatFile = path.join(wwjsDir, GROUP_CHAT_PATH);
   if (!fs.existsSync(groupChatFile)) {
@@ -161,7 +177,7 @@ function applyParticipantArityPatches(wwjsDir = DEFAULT_WWJS) {
   }
 
   if (applied.length) {
-    fs.writeFileSync(groupChatFile, source);
+    writeFileAtomic(groupChatFile, source);
   }
   return { applied, skipped };
 }
@@ -189,6 +205,7 @@ if (require.main === module) run();
 
 module.exports = {
   applyParticipantArityPatches,
+  isApplied,
   GROUPS,
   ACTIONS,
   findFor,

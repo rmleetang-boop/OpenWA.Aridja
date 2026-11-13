@@ -18,7 +18,8 @@ import { type createLogger } from '../../common/services/logger.service';
 export class SessionStatusBroadcaster {
   // Last session.status value broadcast per session. Some engines signal one transition via BOTH
   // onStateChanged and a dedicated callback (onQRCode/onDisconnected), so this guards both the WS emit
-  // and the webhook POST against firing the same status twice. Cleared on delete().
+  // and the webhook POST against firing the same status twice. Cleared on delete(), and before a
+  // lapsed-row or released-row correction is announced (see SessionEngineLifecycle.announceStatus).
   readonly lastDispatchedStatus = new Map<string, SessionStatus>();
 
   private readonly sessionRepository: Repository<Session>;
@@ -38,13 +39,33 @@ export class SessionStatusBroadcaster {
     this.logger = deps.logger;
   }
 
-  async updateStatus(id: string, status: SessionStatus): Promise<void> {
+  /**
+   * `canAnnounce`, when given, is asked once the write has settled: a caller whose engine can retire
+   * while the write is in flight keeps a late reply from announcing a status that is no longer current.
+   */
+  async updateStatus(id: string, status: SessionStatus, canAnnounce?: () => boolean): Promise<void> {
     await this.sessionRepository.update(id, { status });
     this.logger.debug(`Session status updated to ${status}`, {
       sessionId: id,
       status,
       action: 'status_update',
     });
+    if (canAnnounce?.() === false) return;
+    this.announce(id, status);
+  }
+
+  /**
+   * The fan-out half of updateStatus, for a caller that has ALREADY written the row itself.
+   *
+   * A write that can land after the session changed hands has to go under a predicate, never by id,
+   * because a peer can claim and start the row at any moment; writing by id afterwards to get the
+   * fan-out would undo the predicate. Four writes need that split: the correction of a row whose
+   * owning node is gone (still that node's, still lapsed, still claiming to run) and a failed start's
+   * released row (unclaimed, still claiming to run), both through SessionEngineLifecycle.announceStatus,
+   * and the retired launch and the init-timeout eviction (this node's row or an unowned one), which
+   * call this directly. Everything else must keep using updateStatus.
+   */
+  announce(id: string, status: SessionStatus): void {
     // Mirror the status change to WS clients AND subscribed webhooks — both de-duped. Some engines signal
     // one transition via both onStateChanged AND a dedicated callback (onQRCode/onDisconnected), which
     // would otherwise emit/POST the same status twice; only act when it actually changed from the last one.
@@ -55,7 +76,11 @@ export class SessionStatusBroadcaster {
     }
   }
 
-  /** Drop the de-dup entry for a session — called from delete()'s committed-delete cleanup. */
+  /**
+   * Drop the de-dup entry for a session — called from delete()'s committed-delete cleanup, and
+   * before a lapsed-row or released-row correction announces, since that write is a transition this
+   * process never saw.
+   */
   clear(id: string): void {
     this.lastDispatchedStatus.delete(id);
   }

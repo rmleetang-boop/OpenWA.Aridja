@@ -1,11 +1,10 @@
 import { type Client } from 'whatsapp-web.js';
 import { Channel, ChannelMessage } from '../interfaces/whatsapp-engine.interface';
-import { BusinessClient, WwjsChannelData } from '../types/whatsapp-web-js.types';
+import { BusinessClient, WwjsChannelData, readWid } from '../types/whatsapp-web-js.types';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
-import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { ChannelNotFoundError } from '../../common/errors/channel-not-found.error';
-import { type WwebjsEngineHost } from './wwebjs-host';
+import { type WwebjsEngineHost, withPage, reportPageDeath } from './wwebjs-host';
 
 /**
  * Channel/Newsletter operations extracted from WhatsAppWebJsAdapter. The adapter keeps the public
@@ -20,21 +19,9 @@ export class WwebjsChannels {
     return this.host.getClient();
   }
 
-  /**
-   * Run a client operation, classifying a dead page/transport as the documented 503 plus an early
-   * death signal instead of an opaque 500 under a status that still says READY - the split every
-   * chats read already makes (#1081). Other errors propagate unchanged.
-   */
-  private async withPage<T>(context: string, op: () => Promise<T>): Promise<T> {
-    try {
-      return await op();
-    } catch (error) {
-      if (this.host.isPageTransportError(error)) {
-        this.host.reportIfPageTransportError(error, context);
-        throw new EngineTransportError(`Transport died during ${context}`);
-      }
-      throw error;
-    }
+  /** See {@link withPage} for what a dead page answers here. */
+  private withPage<T>(context: string, op: () => Promise<T>): Promise<T> {
+    return withPage(this.host, context, op);
   }
 
   async getSubscribedChannels(): Promise<Channel[]> {
@@ -48,7 +35,7 @@ export class WwebjsChannels {
     return channels.map((ch: WwjsChannelData) => ({
       // Read `$1` before giving up (#747: WA Web's minifier renamed the serialized property), and
       // never String() the object branch — that manufactures the literal "undefined" as an id.
-      id: (typeof ch.id === 'object' ? (ch.id._serialized ?? ch.id.$1) : String(ch.id)) || '',
+      id: readWid(ch.id) || '',
       name: String(ch.name || ''),
       description: ch.description ? String(ch.description) : undefined,
       inviteCode: ch.inviteCode ? String(ch.inviteCode) : undefined,
@@ -67,7 +54,9 @@ export class WwebjsChannels {
    */
   async createChannel(name: string, description?: string): Promise<Channel> {
     this.host.ensureReady();
-    const result = await this.withPage('createChannel', () =>
+    // Non-idempotent, matching ./baileys-channels, which leaves this unbounded for the same
+    // reason: a replayed create leaves a duplicate channel behind. See reportPageDeath.
+    const result = await reportPageDeath(this.host, 'createChannel', () =>
       (this.client() as unknown as BusinessClient).createChannel(
         name,
         description === undefined ? {} : { description },
@@ -79,7 +68,7 @@ export class WwebjsChannels {
     // The nid crosses the puppeteer boundary as a raw page-context Wid, exactly the object class
     // WA Web's minifier rename hits (#747): read `$1` before giving up, and never String() an
     // absent id — a channel with the literal id "undefined" is unusable for every follow-up call.
-    const channelId = result.nid._serialized ?? result.nid.$1;
+    const channelId = readWid(result.nid);
     if (!channelId) {
       throw new EngineRefusedError(`Channel '${name}' was created but its id was unreadable — refusing to return it`);
     }
@@ -181,6 +170,8 @@ export class WwebjsChannels {
     if (!act) {
       throw new ChannelNotFoundError(channelId);
     }
+    // The channel acts through its own client, which getClient's readiness check never sees again.
+    this.host.ensureReady();
     const ok = await this.withPage('muteChannel', () => act.call(chat));
     if (!ok) {
       throw new EngineRefusedError(`Failed to ${mute ? 'mute' : 'unmute'} channel ${channelId}`);
@@ -217,7 +208,7 @@ export class WwebjsChannels {
     if (!ok) {
       throw new EngineRefusedError(`Failed to unsubscribe from channel ${channelId}`);
     }
-    this.host.logger.log(`Unsubscribed from channel: ${channelId}`);
+    this.host.logger.debug('Unsubscribed from channel', { channelId });
   }
 
   async getChannelMessages(channelId: string, limit: number = 50): Promise<ChannelMessage[]> {
@@ -230,7 +221,7 @@ export class WwebjsChannels {
     const channels = await this.withPage('getChannelMessages', () =>
       (this.client() as unknown as BusinessClient).getChannels(),
     );
-    const channel = channels?.find(c => (typeof c.id === 'object' ? c.id._serialized : c.id) === channelId);
+    const channel = channels?.find(c => readWid(c.id) === channelId);
     if (!channel) {
       throw new ChannelNotFoundError(channelId);
     }
@@ -244,11 +235,10 @@ export class WwebjsChannels {
       // unreadable id into the literal "undefined" rather than the empty sentinel every other path
       // uses. Read-only endpoint — never persisted, never ack-matched — so `''` carries no collision
       // risk here; it just means "id unreadable".
-      id: (typeof msg.id === 'object' ? (msg.id?._serialized ?? msg.id?.$1) : msg.id) || '',
+      id: readWid(msg.id) || '',
       body: String(msg.body || ''),
       timestamp: Number(msg.timestamp),
       hasMedia: Boolean(msg.hasMedia),
-      mediaUrl: msg.mediaUrl ? String(msg.mediaUrl) : undefined,
     }));
   }
 }
